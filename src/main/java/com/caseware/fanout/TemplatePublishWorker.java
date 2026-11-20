@@ -1,12 +1,15 @@
 package com.caseware.fanout;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /** Bounded, resumable fan-out. Durable adapters are supplied by the hosting service. */
@@ -55,15 +58,29 @@ public final class TemplatePublishWorker implements AutoCloseable {
 
     public interface CapacityGate {
         /** Acquire a globally coordinated permit, waiting at most for the supplied duration. */
-        Permit acquire(Duration timeout) throws InterruptedException;
+        Permit acquire(Duration timeout) throws InterruptedException, CapacityUnavailableException;
         interface Permit extends AutoCloseable {
             @Override void close();
         }
     }
 
+    /** Capacity pressure defers the publish event for queue retry; it is not a bad engagement. */
+    public static final class CapacityUnavailableException extends Exception {
+        private static final long serialVersionUID = 1L;
+        public CapacityUnavailableException(String message) { super(message); }
+        public CapacityUnavailableException(String message, Throwable cause) { super(message, cause); }
+    }
+
     public interface PendingRefresh {
-        /** Idempotent by key; must not apply template content. */
+        /** Idempotent by key; may take about one minute and must not apply template content. */
         void refreshPending(Publish publish, EngagementRef engagement, String idempotencyKey) throws Exception;
+    }
+
+    /** A known permanent input or policy failure that should go to the DLQ without retry. */
+    public static final class NonRetryableFailure extends Exception {
+        private static final long serialVersionUID = 1L;
+        public NonRetryableFailure(String message) { super(message); }
+        public NonRetryableFailure(String message, Throwable cause) { super(message, cause); }
     }
 
     public interface CheckpointStore {
@@ -98,17 +115,24 @@ public final class TemplatePublishWorker implements AutoCloseable {
     }
 
     /** Safe to redeliver: page replay uses the same per-item idempotency keys. */
-    public void process(Publish publish) throws InterruptedException {
+    public void process(Publish publish) throws InterruptedException, CapacityUnavailableException {
         Objects.requireNonNull(publish, "publish");
         var cursor = checkpoints.load(publish.eventId());
         while (true) {
             var page = Objects.requireNonNull(index.findPage(
                     publish.productId(), publish.market(), cursor, limits.pageSize()), "index page");
             if (page.items().isEmpty()) {
-                if (page.nextCursor() == null || Objects.equals(cursor, page.nextCursor())) break;
+                if (page.nextCursor() == null) break;
+                if (Objects.equals(cursor, page.nextCursor())) {
+                    throw new IllegalStateException("engagement index pagination cursor did not advance");
+                }
                 cursor = page.nextCursor();
                 checkpoints.save(publish.eventId(), cursor);
                 continue;
+            }
+
+            if (page.nextCursor() != null && Objects.equals(cursor, page.nextCursor())) {
+                throw new IllegalStateException("engagement index pagination cursor did not advance");
             }
 
             processPage(publish, page.items());
@@ -119,32 +143,53 @@ public final class TemplatePublishWorker implements AutoCloseable {
         checkpoints.complete(publish.eventId());
     }
 
-    private void processPage(Publish publish, List<EngagementRef> refs) throws InterruptedException {
+    private void processPage(Publish publish, List<EngagementRef> refs)
+            throws InterruptedException, CapacityUnavailableException {
         var completions = new ExecutorCompletionService<Void>(executor);
-        var inFlight = 0;
-        for (var ref : refs) {
-            completions.submit(() -> {
-                deliver(publish, ref);
-                return null;
-            });
-            inFlight++;
-            if (inFlight == limits.concurrency()) {
-                awaitOne(completions);
-                inFlight--;
+        var outstanding = new ArrayList<Future<Void>>();
+        var failures = new ArrayList<Throwable>();
+        try {
+            for (var ref : refs) {
+                outstanding.add(completions.submit(() -> {
+                    deliver(publish, ref);
+                    return null;
+                }));
+                if (outstanding.size() == limits.concurrency()) {
+                    awaitOne(completions, outstanding, failures);
+                }
             }
+            while (!outstanding.isEmpty()) awaitOne(completions, outstanding, failures);
+        } catch (InterruptedException interrupted) {
+            outstanding.forEach(task -> task.cancel(true));
+            throw interrupted;
         }
-        while (inFlight > 0) {
-            awaitOne(completions);
-            inFlight--;
+        if (!failures.isEmpty()) {
+            var failure = failures.get(0);
+            if (failure instanceof InterruptedException interrupted) throw interrupted;
+            if (failure instanceof CapacityUnavailableException unavailable) throw unavailable;
+            throw new IllegalStateException("fan-out page failed before durable completion", failure);
         }
     }
 
-    private void deliver(Publish publish, EngagementRef ref) throws InterruptedException {
+    private void deliver(Publish publish, EngagementRef ref)
+            throws InterruptedException, CapacityUnavailableException {
         var key = "%s:%s:%s".formatted(publish.eventId(), ref.firmId(), ref.engagementId());
         Exception lastFailure = null;
         for (var attempt = 1; attempt <= limits.maxAttempts(); attempt++) {
-            try (var permit = gate.acquire(limits.permitTimeout())) {
+            CapacityGate.Permit permit;
+            try {
+                permit = Objects.requireNonNull(gate.acquire(limits.permitTimeout()), "capacity gate permit");
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            } catch (CapacityUnavailableException unavailable) {
+                throw unavailable;
+            }
+            try (permit) {
                 downstream.refreshPending(publish, ref, key);
+                return;
+            } catch (NonRetryableFailure permanent) {
+                deadLetter.record(publish, ref, key, permanent.toString());
                 return;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -162,19 +207,24 @@ public final class TemplatePublishWorker implements AutoCloseable {
 
     private Duration backoff(int failedAttempt) {
         var multiplier = 1L << Math.min(failedAttempt - 1, 20);
-        var baseMillis = limits.retryBase().toMillis();
-        var delayMillis = baseMillis > TimeUnit.MINUTES.toMillis(5) / multiplier
-                ? TimeUnit.MINUTES.toMillis(5) : baseMillis * multiplier;
-        return Duration.ofMillis(Math.min(delayMillis, TimeUnit.MINUTES.toMillis(5)));
+        var capMillis = TimeUnit.MINUTES.toMillis(5);
+        var baseMillis = limits.retryBase().compareTo(Duration.ofMillis(capMillis)) > 0
+                ? capMillis : limits.retryBase().toMillis();
+        var ceilingMillis = baseMillis > capMillis / multiplier ? capMillis : baseMillis * multiplier;
+        var jitterMillis = ceilingMillis == 0 ? 0 : ThreadLocalRandom.current().nextLong(ceilingMillis + 1);
+        return Duration.ofMillis(jitterMillis);
     }
 
-    private static void awaitOne(ExecutorCompletionService<Void> completions) throws InterruptedException {
+    private static void awaitOne(ExecutorCompletionService<Void> completions, List<Future<Void>> outstanding,
+                                 List<Throwable> failures) throws InterruptedException {
+        var completed = completions.take();
+        outstanding.remove(completed);
         try {
-            completions.take().get();
+            completed.get();
         } catch (ExecutionException failure) {
-            var cause = failure.getCause();
-            if (cause instanceof InterruptedException interrupted) throw interrupted;
-            throw new IllegalStateException("fan-out task failed before durable completion", cause);
+            failures.add(failure.getCause());
+        } catch (java.util.concurrent.CancellationException failure) {
+            failures.add(failure);
         }
     }
 
