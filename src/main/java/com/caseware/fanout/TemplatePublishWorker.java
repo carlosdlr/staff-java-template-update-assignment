@@ -1,6 +1,6 @@
 package com.caseware.fanout;
 
-import java.io.*;
+import java.io.Serial;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -84,6 +84,7 @@ public final class TemplatePublishWorker implements AutoCloseable {
         @Serial
         private static final long serialVersionUID = 1L;
 
+        public PendingRefreshException(String message) { super(message); }
         public PendingRefreshException(String message, Throwable cause) { super(message, cause); }
     }
 
@@ -190,6 +191,7 @@ public final class TemplatePublishWorker implements AutoCloseable {
             }));
             if (outstanding.size() == limits.concurrency()) {
                 awaitOne(completions, outstanding, failures);
+                if (!failures.isEmpty()) break;
             }
         }
         while (!outstanding.isEmpty()) awaitOne(completions, outstanding, failures);
@@ -197,11 +199,15 @@ public final class TemplatePublishWorker implements AutoCloseable {
 
     private static void throwFirstFailure(List<Throwable> failures)
             throws InterruptedException, CapacityUnavailableException {
-        if (!failures.isEmpty()) {
-            var failure = failures.getFirst();
+        for (var failure : failures) {
             if (failure instanceof InterruptedException interrupted) throw interrupted;
+        }
+        for (var failure : failures) {
             if (failure instanceof CapacityUnavailableException unavailable) throw unavailable;
-            throw new IllegalStateException("fan-out page failed before durable completion", failure);
+        }
+        if (!failures.isEmpty()) {
+            throw new IllegalStateException(
+                    "fan-out page failed before durable completion", failures.getFirst());
         }
     }
 
@@ -210,27 +216,23 @@ public final class TemplatePublishWorker implements AutoCloseable {
         var key = "%s:%s:%s".formatted(publish.eventId(), ref.firmId(), ref.engagementId());
         Exception lastFailure = null;
         for (var attempt = 1; attempt <= limits.maxAttempts(); attempt++) {
-            CapacityGate.Permit permit;
             try {
-                permit = Objects.requireNonNull(gate.acquire(limits.permitTimeout()), "capacity gate permit");
+                try (var permit = Objects.requireNonNull(
+                        gate.acquire(limits.permitTimeout()), "capacity gate permit")) {
+                    downstream.refreshPending(publish, ref, key);
+                    return;
+                }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw interrupted;
-            }
-            try (permit) {
-                downstream.refreshPending(publish, ref, key);
-                return;
             } catch (NonRetryableFailure permanent) {
                 deadLetter.recordFailure(publish, ref, key, permanent.toString());
                 return;
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw interrupted;
             } catch (PendingRefreshException failure) {
                 lastFailure = failure;
-                if (attempt < limits.maxAttempts()) {
-                    Thread.sleep(backoff(attempt).toMillis());
-                }
+            }
+            if (attempt < limits.maxAttempts()) {
+                Thread.sleep(backoff(attempt).toMillis());
             }
         }
         deadLetter.recordFailure(publish, ref, key,
