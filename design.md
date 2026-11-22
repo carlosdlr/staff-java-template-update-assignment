@@ -38,6 +38,16 @@ database, outbox relay, queue, regional index, summary pipeline, and engagement 
 this implementation. The worker's downstream call only makes the engagement aware of a target or
 enqueues a local refresh; it must not apply template content.
 
+## Example AWS mapping
+
+The design is intentionally cloud-agnostic; this is one possible fit for an AWS environment, not a
+requirement to change the architecture. Keep the existing shared template catalog on its current
+database (or Amazon RDS/Aurora if a managed AWS database is needed). An outbox relay can publish to
+regional Amazon SQS queues; run the bounded Java worker on ECS with Fargate, and store the regional
+reference projection in DynamoDB. Store immutable regional evidence in S3, and use CloudWatch for
+metrics, logs, and alarms. Preserve the same durability, idempotency, regional-residency, and
+capacity controls regardless of the AWS service selected.
+
 ## Correctness, decisions, and evolution
 
 Versions form a directed graph, not a numeric sequence. For each market/branch, offer only a
