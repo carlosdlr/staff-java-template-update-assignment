@@ -13,3 +13,15 @@ AI helped draft the first design and worker. Review against the brief identified
 ## Run
 
 Requires JDK 25 and Maven. `mvn package` compiles the component. The core has no runtime dependencies. Validation note: source compilation succeeded with JDK 23, but the configured Java 25 release target still needs verification on JDK 25.
+
+## Database and simulations
+
+PostgreSQL is the selected regional database for the engagement-reference projection, publish checkpoints, and idempotency ledger. Its relational constraints and transactions fit the version/market lookups and safe replay path; keyset pagination uses `(region, product_id, market, engagement_id)`. Keep engagement data and database instances within each firm’s residency region. Store immutable summary evidence in regional object storage rather than growing the hot index tables. Start with managed RDS for PostgreSQL; consider Aurora PostgreSQL only after measured availability or throughput needs justify it.
+
+Run the database-backed worker simulations with Docker available to Testcontainers:
+
+```sh
+mvn verify
+```
+
+`PostgresFanoutSimulationTest` launches an isolated PostgreSQL 17 container and checks paged scans, idempotent redelivery, transient retries, permanent-failure DLQ handling, concurrency bounds, and capacity-pressure deferral. These are behavior simulations, not production load benchmarks; the hosting service still supplies the durable queue and globally coordinated permit implementation.
