@@ -1,5 +1,6 @@
 package com.caseware.fanout;
 
+import java.io.*;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -66,6 +67,7 @@ public final class TemplatePublishWorker implements AutoCloseable {
 
     /** Capacity pressure defers the publish event for queue retry; it is not a bad engagement. */
     public static final class CapacityUnavailableException extends Exception {
+        @Serial
         private static final long serialVersionUID = 1L;
         public CapacityUnavailableException(String message) { super(message); }
         public CapacityUnavailableException(String message, Throwable cause) { super(message, cause); }
@@ -73,14 +75,23 @@ public final class TemplatePublishWorker implements AutoCloseable {
 
     public interface PendingRefresh {
         /** Idempotent by key; may take about one minute and must not apply template content. */
-        void refreshPending(Publish publish, EngagementRef engagement, String idempotencyKey) throws Exception;
+        void refreshPending(Publish publish, EngagementRef engagement, String idempotencyKey)
+                throws PendingRefreshException, InterruptedException, NonRetryableFailure;
+    }
+
+    /** A transient downstream failure that should be retried by the worker. */
+    public static final class PendingRefreshException extends Exception {
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        public PendingRefreshException(String message, Throwable cause) { super(message, cause); }
     }
 
     /** A known permanent input or policy failure that should go to the DLQ without retry. */
     public static final class NonRetryableFailure extends Exception {
+        @Serial
         private static final long serialVersionUID = 1L;
         public NonRetryableFailure(String message) { super(message); }
-        public NonRetryableFailure(String message, Throwable cause) { super(message, cause); }
     }
 
     public interface CheckpointStore {
@@ -93,7 +104,7 @@ public final class TemplatePublishWorker implements AutoCloseable {
 
     public interface DeadLetter {
         /** Must durably record the failure before returning. */
-        void record(Publish publish, EngagementRef engagement, String idempotencyKey, String reason);
+        void recordFailure(Publish publish, EngagementRef engagement, String idempotencyKey, String reason);
     }
 
     private final EngagementIndex index;
@@ -118,29 +129,40 @@ public final class TemplatePublishWorker implements AutoCloseable {
     public void process(Publish publish) throws InterruptedException, CapacityUnavailableException {
         Objects.requireNonNull(publish, "publish");
         var cursor = checkpoints.load(publish.eventId());
-        while (true) {
+        processPages(publish, cursor);
+        checkpoints.complete(publish.eventId());
+    }
+
+    private void processPages(Publish publish, String cursor)
+            throws InterruptedException, CapacityUnavailableException {
+        var hasMorePages = true;
+        while (hasMorePages) {
             var page = Objects.requireNonNull(index.findPage(
                     publish.productId(), publish.market(), cursor, limits.pageSize()), "index page");
             if (page.items().isEmpty()) {
-                if (page.nextCursor() == null) break;
-                if (Objects.equals(cursor, page.nextCursor())) {
-                    throw new IllegalStateException("engagement index pagination cursor did not advance");
-                }
+                cursor = advanceEmptyPage(publish, cursor, page);
+                hasMorePages = cursor != null;
+            } else {
+                validateCursorAdvance(cursor, page.nextCursor());
+                processPage(publish, page.items());
                 cursor = page.nextCursor();
-                checkpoints.save(publish.eventId(), cursor);
-                continue;
+                if (cursor != null) checkpoints.save(publish.eventId(), cursor);
+                hasMorePages = cursor != null;
             }
-
-            if (page.nextCursor() != null && Objects.equals(cursor, page.nextCursor())) {
-                throw new IllegalStateException("engagement index pagination cursor did not advance");
-            }
-
-            processPage(publish, page.items());
-            cursor = page.nextCursor();
-            if (cursor != null) checkpoints.save(publish.eventId(), cursor);
-            if (cursor == null) break;
         }
-        checkpoints.complete(publish.eventId());
+    }
+
+    private String advanceEmptyPage(Publish publish, String cursor, Page page) {
+        if (page.nextCursor() == null) return null;
+        validateCursorAdvance(cursor, page.nextCursor());
+        checkpoints.save(publish.eventId(), page.nextCursor());
+        return page.nextCursor();
+    }
+
+    private static void validateCursorAdvance(String cursor, String nextCursor) {
+        if (nextCursor != null && Objects.equals(cursor, nextCursor)) {
+            throw new IllegalStateException("engagement index pagination cursor did not advance");
+        }
     }
 
     private void processPage(Publish publish, List<EngagementRef> refs)
@@ -149,22 +171,34 @@ public final class TemplatePublishWorker implements AutoCloseable {
         var outstanding = new ArrayList<Future<Void>>();
         var failures = new ArrayList<Throwable>();
         try {
-            for (var ref : refs) {
-                outstanding.add(completions.submit(() -> {
-                    deliver(publish, ref);
-                    return null;
-                }));
-                if (outstanding.size() == limits.concurrency()) {
-                    awaitOne(completions, outstanding, failures);
-                }
-            }
-            while (!outstanding.isEmpty()) awaitOne(completions, outstanding, failures);
+            submitAndCollect(publish, refs, completions, outstanding, failures);
         } catch (InterruptedException interrupted) {
             outstanding.forEach(task -> task.cancel(true));
             throw interrupted;
         }
+        throwFirstFailure(failures);
+    }
+
+    private void submitAndCollect(Publish publish, List<EngagementRef> refs,
+                                  ExecutorCompletionService<Void> completions,
+                                  List<Future<Void>> outstanding, List<Throwable> failures)
+            throws InterruptedException {
+        for (var ref : refs) {
+            outstanding.add(completions.submit(() -> {
+                deliver(publish, ref);
+                return null;
+            }));
+            if (outstanding.size() == limits.concurrency()) {
+                awaitOne(completions, outstanding, failures);
+            }
+        }
+        while (!outstanding.isEmpty()) awaitOne(completions, outstanding, failures);
+    }
+
+    private static void throwFirstFailure(List<Throwable> failures)
+            throws InterruptedException, CapacityUnavailableException {
         if (!failures.isEmpty()) {
-            var failure = failures.get(0);
+            var failure = failures.getFirst();
             if (failure instanceof InterruptedException interrupted) throw interrupted;
             if (failure instanceof CapacityUnavailableException unavailable) throw unavailable;
             throw new IllegalStateException("fan-out page failed before durable completion", failure);
@@ -182,26 +216,24 @@ public final class TemplatePublishWorker implements AutoCloseable {
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw interrupted;
-            } catch (CapacityUnavailableException unavailable) {
-                throw unavailable;
             }
             try (permit) {
                 downstream.refreshPending(publish, ref, key);
                 return;
             } catch (NonRetryableFailure permanent) {
-                deadLetter.record(publish, ref, key, permanent.toString());
+                deadLetter.recordFailure(publish, ref, key, permanent.toString());
                 return;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw interrupted;
-            } catch (Exception failure) {
+            } catch (PendingRefreshException failure) {
                 lastFailure = failure;
                 if (attempt < limits.maxAttempts()) {
                     Thread.sleep(backoff(attempt).toMillis());
                 }
             }
         }
-        deadLetter.record(publish, ref, key,
+        deadLetter.recordFailure(publish, ref, key,
                 lastFailure == null ? "unknown failure" : lastFailure.toString());
     }
 
