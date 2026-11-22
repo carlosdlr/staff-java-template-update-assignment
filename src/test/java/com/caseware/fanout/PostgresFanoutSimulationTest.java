@@ -9,7 +9,6 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
@@ -46,7 +45,10 @@ class PostgresFanoutSimulationTest {
     @Test void transientFailureRetriesAndEventuallyCheckpoints() throws Exception {
         seed(1); var calls = new AtomicInteger();
         TemplatePublishWorker.PendingRefresh downstream = (event, ref, key) -> {
-            if (calls.incrementAndGet() == 1) throw new SQLException("simulated timeout");
+            if (calls.incrementAndGet() == 1) {
+                throw new TemplatePublishWorker.PendingRefreshException("simulated timeout",
+                        new SQLException("simulated timeout"));
+            }
             saveRefresh(event, ref, key);
         };
         try (var worker = worker(1, 1, new Gate(1), downstream, new Checkpoints(), new Dlq())) {
@@ -71,7 +73,7 @@ class PostgresFanoutSimulationTest {
 
     @Test void capacityPressureDefersWithoutAdvancingCursorOrDeadLettering() throws Exception {
         seed(1); var checkpoints = new Checkpoints();
-        TemplatePublishWorker.CapacityGate exhausted = timeout -> {
+        TemplatePublishWorker.CapacityGate exhausted = _ -> {
             throw new TemplatePublishWorker.CapacityUnavailableException("quota exhausted");
         };
         try (var worker = worker(1, 1, exhausted, new Refresh(), checkpoints, new Dlq())) {
@@ -106,9 +108,11 @@ class PostgresFanoutSimulationTest {
             s.setString(1,event);try(var r=s.executeQuery()){return r.next()&&r.getBoolean(1);}
         }
     }
-    private static void saveRefresh(TemplatePublishWorker.Publish event, TemplatePublishWorker.EngagementRef ref, String key) throws SQLException {
+    private static void saveRefresh(TemplatePublishWorker.Publish event, TemplatePublishWorker.EngagementRef ref, String key) {
         try(var c=db();var s=c.prepareStatement("INSERT INTO refresh_ledger VALUES(?,?,?) ON CONFLICT(idempotency_key) DO NOTHING")) {
             s.setString(1,key);s.setString(2,event.eventId());s.setString(3,ref.engagementId());s.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not record refresh", e);
         }
     }
 
@@ -140,22 +144,22 @@ class PostgresFanoutSimulationTest {
     }
     private static final class Refresh implements TemplatePublishWorker.PendingRefresh {
         final AtomicInteger active=new AtomicInteger(),peak=new AtomicInteger();
-        public void refreshPending(TemplatePublishWorker.Publish event,TemplatePublishWorker.EngagementRef ref,String key)throws Exception{
+        public void refreshPending(TemplatePublishWorker.Publish event,TemplatePublishWorker.EngagementRef ref,String key){
             peak.accumulateAndGet(active.incrementAndGet(),Math::max);try{saveRefresh(event,ref,key);}finally{active.decrementAndGet();}
         }
     }
     private static final class Dlq implements TemplatePublishWorker.DeadLetter {
-        public void record(TemplatePublishWorker.Publish event,TemplatePublishWorker.EngagementRef ref,String key,String reason){
+        public void recordFailure(TemplatePublishWorker.Publish event,TemplatePublishWorker.EngagementRef ref,String key,String reason){
             try(var c=db();var s=c.prepareStatement("INSERT INTO dead_letter VALUES(?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING")){
                 s.setString(1,key);s.setString(2,event.eventId());s.setString(3,ref.engagementId());s.setString(4,reason);s.executeUpdate();
             }catch(SQLException e){throw new IllegalStateException(e);}
         }
     }
     private static final class Gate implements TemplatePublishWorker.CapacityGate {
-        final Semaphore permits;Gate(int count){permits=new Semaphore(count);}
+        final Semaphore availableLeases;Gate(int count){availableLeases=new Semaphore(count);}
         public Permit acquire(Duration timeout)throws InterruptedException,TemplatePublishWorker.CapacityUnavailableException{
-            if(!permits.tryAcquire(timeout.toMillis(),java.util.concurrent.TimeUnit.MILLISECONDS))throw new TemplatePublishWorker.CapacityUnavailableException("quota exhausted");
-            return permits::release;
+            if(!availableLeases.tryAcquire(timeout.toMillis(),java.util.concurrent.TimeUnit.MILLISECONDS))throw new TemplatePublishWorker.CapacityUnavailableException("quota exhausted");
+            return availableLeases::release;
         }
     }
 }
